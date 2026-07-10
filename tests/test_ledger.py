@@ -1,0 +1,539 @@
+"""test_p2pcp_ledger.py — P2PCP v0.1 adversarial fixtures + happy path.
+
+The Bundle-10 "law-test" discipline generalised to strangers (spec §13): every
+threat in the model becomes a test written to FAIL the attacker, and the happy
+path (§10 genesis) is proved last. Canon: ``docs/P2PCP-v0.1-SPEC.md``.
+
+Run: ``cd 5500fp && python3 -m unittest test_p2pcp_ledger``
+
+All clocks are fixed integers — the ledger never reads the wall clock, so every
+decay/timestamp assertion here is deterministic (§6).
+
+Date: 2026-07-10, Adelaide
+Authors: Stevo (SkepticusMaximus) + Claude (Anthropic)
+"""
+
+import os
+import unittest
+
+from p2pcp import ledger as P
+
+# A fixed reference clock for the whole suite (arbitrary epoch second).
+NOW = 1_800_000_000
+DAY = 24 * 3600
+
+
+def ident(tag: bytes):
+    """Deterministic identity from a short tag (padded to a 32-byte seed)."""
+    return P.Identity.from_seed(tag.ljust(32, b"\x00"))
+
+
+def fresh_pair():
+    """Two opened accounts on a fresh ledger."""
+    a, b = ident(b"worker"), ident(b"requester")
+    led = P.Ledger()
+    led.open_account(a)
+    led.open_account(b)
+    return led, a, b
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# §13 threat fixtures — one test per row of the threat table.
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestForgedReceipt(unittest.TestCase):
+    """Threat: a peer signs a receipt its counterparty never signed.
+    Defence: the counterparty-signature check (§8)."""
+
+    def test_forged_receipt_rejected(self):
+        led, worker, requester = fresh_pair()
+        # The worker forges the requester's signature (signs it himself).
+        r = P.Receipt(worker.account_id, requester.account_id, 5,
+                      P.wire_mmid(b"job"), P.wire_mmid(b"out"),
+                      P.VCLASS_NATIVE, nonce=b"n" * 16)
+        msg = r.signing_bytes()
+        r.worker_sig = worker.sign(msg)
+        r.requester_sig = worker.sign(msg)            # forgery — wrong key
+        rec = P.build_settle_record(worker, led.chains[worker.account_id], r)
+        with self.assertRaises(P.ValidationError) as cm:
+            led.post(rec, r)
+        self.assertEqual(cm.exception.reason, "receipt-requester-sig")
+
+
+class TestTamperedAggregates(unittest.TestCase):
+    """verify() must RECONCILE the money/franchise totals against the records — a
+    dump that inflates balance / earned_ctp / burns without matching records is
+    rejected, else a poisoned .ledger forges spendable credit and voting weight."""
+
+    def test_verify_rejects_inflated_balance(self):
+        led, worker, requester = fresh_pair()
+        led.settle_work(worker, requester, 5)              # a real earning
+        self.assertTrue(led.verify())
+        led.chains[worker.account_id].balance += 10**9     # forge spendable credit
+        self.assertFalse(led.verify())
+
+    def test_verify_rejects_forged_franchise(self):
+        led, worker, requester = fresh_pair()
+        led.settle_work(worker, requester, 5)
+        ch = led.chains[worker.account_id]
+        ch.earned_ctp += 10**9                             # forge burnable pool
+        ch.burns.append((10**9, NOW))                      # forge voting weight
+        self.assertFalse(led.verify())
+
+    def test_verify_rejects_crafted_persisted_dump(self):
+        # A hand-crafted dump: the real records, but fabricated totals bolted on.
+        led, worker, requester = fresh_pair()
+        led.settle_work(worker, requester, 5)
+        d = led.to_dict()
+        cd = d["chains"][worker.account_id.hex()]
+        cd["balance"] = 10**9
+        cd["earned_ctp"] = 10**9
+        cd["burns"] = [[10**9, NOW]]
+        forged = P.Ledger.from_dict(d)
+        self.assertFalse(forged.verify())                  # reconciliation catches it
+
+    def test_verify_accepts_a_legitimate_round_trip(self):
+        led, worker, requester = fresh_pair()
+        led.settle_work(worker, requester, 5)
+        led.burn(worker, 3, timestamp=NOW, now=NOW)
+        self.assertTrue(P.Ledger.from_dict(led.to_dict()).verify())  # no false positive
+
+
+class TestNonPositiveSettle(unittest.TestCase):
+    """Threat: a wire-built receipt (which bypasses make_receipt) carries a
+    non-positive amount, INVERTING the double-entry — the requester mints credit
+    (and, if native, a vote) while the worker is drained. Defence: the TCM refuses
+    any settle whose receipt amount ≤ 0 (§5)."""
+
+    def _signed_receipt(self, worker, requester, amount):
+        r = P.Receipt(worker.account_id, requester.account_id, amount,
+                      P.wire_mmid(b"job"), P.wire_mmid(b"out"),
+                      P.VCLASS_NATIVE, nonce=b"n" * 16)
+        msg = r.signing_bytes()
+        r.worker_sig = worker.sign(msg)
+        r.requester_sig = requester.sign(msg)         # both genuinely sign it
+        return r
+
+    def test_negative_amount_settle_rejected(self):
+        led, worker, requester = fresh_pair()
+        r = self._signed_receipt(worker, requester, -5)
+        rec = P.build_settle_record(worker, led.chains[worker.account_id], r)
+        with self.assertRaises(P.ValidationError) as cm:
+            led.post(rec, r)
+        self.assertEqual(cm.exception.reason, "amount-nonpositive")
+
+    def test_zero_amount_settle_rejected(self):
+        led, worker, requester = fresh_pair()
+        r = self._signed_receipt(worker, requester, 0)
+        rec = P.build_settle_record(worker, led.chains[worker.account_id], r)
+        with self.assertRaises(P.ValidationError) as cm:
+            led.post(rec, r)
+        self.assertEqual(cm.exception.reason, "amount-nonpositive")
+
+    def test_negative_amount_transfer_rejected(self):
+        led, sender, receiver = fresh_pair()
+        a = P.TransferAuth(sender.account_id, receiver.account_id, -5, nonce=b"n" * 16)
+        msg = a.signing_bytes()
+        a.sender_sig = sender.sign(msg)
+        a.receiver_sig = receiver.sign(msg)           # both genuinely sign it
+        rec = P.build_transfer_record(sender, led.chains[sender.account_id], a)
+        with self.assertRaises(P.ValidationError) as cm:
+            led.post(rec, a)
+        self.assertEqual(cm.exception.reason, "amount-nonpositive")
+
+
+class TestSelfMinting(unittest.TestCase):
+    """Threat: one operator signs across two owned identities.
+    Defence: net-zero double-entry (§5) — printing money is structural-impossible."""
+
+    def test_self_minting_nets_zero(self):
+        # One operator owns BOTH A and B and signs both sides.
+        a, b = ident(b"op-A"), ident(b"op-B")
+        led = P.Ledger()
+        led.open_account(a)
+        led.open_account(b)
+        led.settle_work(a, b, 100)          # A "earns" 100 from B, both signed
+        self.assertEqual(led.balance(a.account_id), +100)
+        self.assertEqual(led.balance(b.account_id), -100)
+        # The whole trick sums to zero: no free credit was created.
+        self.assertEqual(led.total_supply(), 0)
+
+
+class TestSelfBurn(unittest.TestCase):
+    """Threat: burning un-earned (self-minted) credit for weight.
+    Defence: only credit earned FROM A COUNTERPARTY may be burned (§10)."""
+
+    def test_burn_with_no_earnings_rejected(self):
+        led, a, _ = fresh_pair()
+        rec = P.build_burn_record(a, led.chains[a.account_id], 1, NOW)
+        with self.assertRaises(P.ValidationError) as cm:
+            led.post(rec, now=NOW)
+        self.assertEqual(cm.exception.reason, "unearned")
+
+    def test_self_counterparty_credit_is_unburnable(self):
+        # X posts a +N settlement whose counterparty is X itself. It is a valid
+        # record but earns NO burnable weight, so the burn is refused.
+        led = P.Ledger()
+        x = ident(b"loner")
+        led.open_account(x)
+        r = P.make_receipt(x, x, 50, b"job", b"out", nonce=b"z" * 16)
+        led.post(P.build_settle_record(x, led.chains[x.account_id], r), r)
+        self.assertEqual(led.balance(x.account_id), 50)
+        self.assertEqual(led.burnable(x.account_id), 0)     # self-earned ≠ earned
+        rec = P.build_burn_record(x, led.chains[x.account_id], 50, NOW)
+        with self.assertRaises(P.ValidationError) as cm:
+            led.post(rec, now=NOW)
+        self.assertEqual(cm.exception.reason, "unearned")
+
+
+class TestDoubleSpendFork(unittest.TestCase):
+    """Threat: two records at one height on one chain (a fork / double-spend).
+    Defence: monotonic height + prev-link — detected locally at post (§5/§9)."""
+
+    def test_fork_detected(self):
+        led, worker, customer = fresh_pair()
+        led.settle_work(worker, customer, 10)            # worker now has credit
+        chain = led.chains[worker.account_id]
+        # Two DIFFERENT burns both extending the same head at the same height.
+        burn1 = P.build_burn_record(worker, chain, 1, NOW)
+        burn2 = P.build_burn_record(worker, chain, 2, NOW)
+        self.assertEqual(burn1.height, burn2.height)      # same height = a fork
+        led.post(burn1, now=NOW)                          # first one wins locally
+        with self.assertRaises(P.ForkError) as cm:
+            led.post(burn2, now=NOW)                      # the fork is rejected
+        self.assertEqual(cm.exception.reason, "height")
+
+
+class TestReceiptReplay(unittest.TestCase):
+    """Threat: re-post a stale receipt-hash.
+    Defence: single-use per chain + monotonic height (§6.1)."""
+
+    def test_receipt_replay_rejected(self):
+        led, worker, requester = fresh_pair()
+        r = P.make_receipt(worker, requester, 20, b"job7", b"out7", nonce=b"once")
+        chain = led.chains[worker.account_id]
+        led.post(P.build_settle_record(worker, chain, r), r)     # first use — ok
+        # Re-post the SAME receipt at the next (valid-link) height.
+        replay = P.build_settle_record(worker, chain, r)
+        with self.assertRaises(P.ValidationError) as cm:
+            led.post(replay, r)
+        self.assertEqual(cm.exception.reason, "receipt-replay")
+
+
+class TestSybilWeightConservation(unittest.TestCase):
+    """Threat: N identities split from one (a Sybil swarm).
+    Defence: weight is conserved under identity-splitting (§10). Splitting buys
+    NOTHING for voting."""
+
+    def _burn_weight(self, led, customer, worker, amount, burn_time, eval_now):
+        led.open_account(worker)
+        led.settle_work(worker, customer, amount)        # earn from a counterparty
+        led.burn(worker, amount, timestamp=burn_time, now=burn_time)
+        return led.weight(worker.account_id, eval_now)
+
+    def test_split_conserves_weight(self):
+        burn_time = NOW
+        eval_now = NOW + 5 * DAY                          # exercise real decay
+        N = 1000
+
+        # Swarm: 1000 identities, 1 burn each, all against a shared customer.
+        led1 = P.Ledger()
+        cust1 = ident(b"cust-1")
+        led1.open_account(cust1)
+        swarm_total = 0.0
+        for i in range(N):
+            w = P.Identity.from_seed(b"swarm" + i.to_bytes(27, "big"))
+            swarm_total += self._burn_weight(led1, cust1, w, 1, burn_time, eval_now)
+
+        # Whale: one identity, the whole 1000 burned at once, same clocks.
+        led2 = P.Ledger()
+        cust2 = ident(b"cust-2")
+        led2.open_account(cust2)
+        whale = ident(b"whale")
+        whale_total = self._burn_weight(led2, cust2, whale, N, burn_time, eval_now)
+
+        self.assertGreater(swarm_total, 0.0)
+        self.assertAlmostEqual(swarm_total, whale_total, places=6)
+
+
+class TestDeadbeatSettlementGranularity(unittest.TestCase):
+    """Threat: a worker takes a job and returns nothing (or a requester stops
+    paying). Defence: settlement granularity (§11) — settle per chunk, so
+    neither party is exposed for more than k units."""
+
+    def test_deadbeat_exposure_bounded(self):
+        led, worker, requester = fresh_pair()
+        n_chunks, k = 10, 1                               # k = 1 unit per chunk
+        delivered = 6                                     # worker quits after 6
+        for _ in range(delivered):
+            led.settle_work(worker, requester, k)         # settle each chunk
+        # The requester is debited ONLY for delivered chunks; the 4 undelivered
+        # chunks left zero ledger footprint. Exposure never exceeds k.
+        self.assertEqual(led.balance(worker.account_id), +delivered * k)
+        self.assertEqual(led.balance(requester.account_id), -delivered * k)
+        undelivered = n_chunks - delivered
+        self.assertEqual(undelivered * k, 4)              # never posted, never owed
+        # Per chunk the books balance exactly (delivered == paid at every
+        # boundary), so the in-flight exposure is never more than one chunk = k.
+        self.assertEqual(led.balance(worker.account_id),
+                         -led.balance(requester.account_id))
+        self.assertEqual(len(led.chains[worker.account_id].records) - 1, delivered)
+
+
+class TestClockSkew(unittest.TestCase):
+    """Threat: a BURN timestamp hours off the reference clock.
+    Defence: ±tolerance reject (§6.2). Weight itself is computed locally."""
+
+    def test_skewed_timestamp_rejected_and_within_accepted(self):
+        led, worker, customer = fresh_pair()
+        led.settle_work(worker, customer, 10)
+        chain = led.chains[worker.account_id]
+
+        # 7 hours skew > ±6h tolerance → rejected.
+        far = P.build_burn_record(worker, chain, 3, NOW + 7 * 3600)
+        with self.assertRaises(P.ValidationError) as cm:
+            led.post(far, now=NOW)
+        self.assertEqual(cm.exception.reason, "timestamp")
+
+        # 1 hour skew is within tolerance → accepted.
+        near = P.build_burn_record(worker, chain, 3, NOW + 3600)
+        led.post(near, now=NOW)
+        self.assertGreater(led.weight(worker.account_id, NOW), 0.0)
+
+
+class TestAlgNegotiation(unittest.TestCase):
+    """Threat: a word tagged with an unimplemented / unknown primitive.
+    Defence: graceful reject via the data-driven `alg` table (§12.1). Never a
+    crash or a KeyError."""
+
+    def test_alg0_roundtrips(self):
+        alg = P.get_alg(P.ALG_ED25519)
+        idn = ident(b"a0")
+        msg = b"hello mesh"
+        sig = alg.sign(idn.signing_key, msg)
+        self.assertTrue(alg.verify(idn.account_id, sig, msg))
+        self.assertFalse(alg.verify(idn.account_id, sig, b"tampered"))
+        self.assertEqual(len(alg.wire_digest(msg)), 32)
+
+    def test_alg1_recognized_but_unimplemented(self):
+        alg = P.get_alg(P.ALG_TERNARY_NATIVE)             # recognized...
+        with self.assertRaises(P.AlgUnimplemented):       # ...but refuses on use
+            alg.wire_digest(b"x")
+        # A record tagged alg=1 is refused gracefully, not crashed.
+        rec = P.Record(ident(b"z").account_id, 0, b"", P.KIND_OPEN, {}, alg=1,
+                       sig=b"x")
+        with self.assertRaises(P.AlgUnimplemented):
+            P.validate_record(rec, P.Chain(rec.account))
+
+    def test_unknown_alg_rejected(self):
+        with self.assertRaises(P.UnknownAlg):
+            P.get_alg(7)
+        rec = P.Record(ident(b"q").account_id, 0, b"", P.KIND_OPEN, {}, alg=7,
+                       sig=b"x")
+        with self.assertRaises(P.UnknownAlg):
+            P.validate_record(rec, P.Chain(rec.account))
+
+
+class TestBlindedCommitment(unittest.TestCase):
+    """Threat: correlation of a requester via a repeated job MMID.
+    Defence: blinded commitment H(MMID‖nonce) with a per-receipt nonce (§7.3)."""
+
+    def test_same_job_two_nonces_do_not_correlate(self):
+        job_commit = P.wire_mmid(b"the-same-job-cargo")
+        c1 = P.blinded_commitment(job_commit, b"nonce-one")
+        c2 = P.blinded_commitment(job_commit, b"nonce-two")
+        self.assertNotEqual(c1, c2)                       # cannot be linked
+        self.assertNotEqual(c1, job_commit)               # never the bare commit
+        # The nonce is ALSO the reveal key (§7): opening reproduces the
+        # commitment, so privacy-by-default and audit-on-demand share one word.
+        self.assertTrue(P.open_commitment(c1, job_commit, b"nonce-one"))
+        self.assertFalse(P.open_commitment(c1, job_commit, b"nonce-two"))
+
+    def test_ledger_stores_blinded_not_bare_mmid(self):
+        led, worker, requester = fresh_pair()
+        led.settle_work(worker, requester, 5, job=b"secret-job",
+                        output=b"secret-output")
+        body = led.chains[worker.account_id].records[-1].body
+        self.assertIn("blinded", body)
+        self.assertIn("receipt_hash", body)
+        # Neither the job nor the output commitment appears on-ledger (§7): the
+        # raw references live only in the pairwise receipt.
+        self.assertNotIn("job_commit", body)
+        self.assertNotIn("output_commit", body)
+
+
+class TestWireMmidSubstitution(unittest.TestCase):
+    """Threat: a forged wire digest substitutes cargo.
+    Defence: gauntlet-grade wire digest + verify-on-fetch (§12.4)."""
+
+    def test_substituted_cargo_detected(self):
+        cargo = b"the real model shard bytes"
+        claimed = P.wire_mmid(cargo)
+        self.assertTrue(P.verify_wire_cargo(claimed, cargo))     # honest fetch
+        with self.assertRaises(P.WireMmidError):
+            P.verify_wire_cargo(claimed, b"a malicious substitute")
+
+
+class TestWeightBearingFranchise(unittest.TestCase):
+    """CAI's Q3 correction (2026-07-10): weight is priced in VERIFIABLE CYCLES,
+    not in counterparty signatures. Only replay-class work mints weight-bearing
+    credit; float earns money, never a vote (§3/§10). Debit-abandonment and the
+    sockpuppet-weight attack are one attack, closed by audit-by-replay — not a
+    balance floor."""
+
+    def test_float_work_earns_credit_but_never_weight(self):
+        led, worker, customer = fresh_pair()
+        led.settle_work(worker, customer, 10, vclass=P.VCLASS_FLOAT)
+        self.assertEqual(led.balance(worker.account_id), +10)   # money, yes
+        self.assertEqual(led.burnable(worker.account_id), 0)    # a vote, no
+        rec = P.build_burn_record(worker, led.chains[worker.account_id], 1, NOW)
+        with self.assertRaises(P.ValidationError) as cm:
+            led.post(rec, now=NOW)
+        self.assertEqual(cm.exception.reason, "unearned")
+
+    def test_replay_work_is_weight_bearing(self):
+        led, worker, customer = fresh_pair()
+        led.settle_work(worker, customer, 10, vclass=P.VCLASS_NATIVE)
+        self.assertEqual(led.burnable(worker.account_id), 10)   # replay → weight
+        led.burn(worker, 4, timestamp=NOW, now=NOW)
+        self.assertGreater(led.weight(worker.account_id, NOW), 0.0)
+
+    def test_forged_output_fails_replay_challenge(self):
+        # A worker signs a native (replay-class) receipt but commits to output it
+        # never produced. Any peer replays the job and catches it (§7/§9).
+        w, r = ident(b"w"), ident(b"r")
+        honest = P.make_receipt(w, r, 5, job=b"job", output=b"HONEST-OUTPUT",
+                                vclass=P.VCLASS_NATIVE, nonce=b"n" * 16)
+        self.assertTrue(P.challenge_receipt(honest, b"HONEST-OUTPUT"))
+        forged = P.make_receipt(w, r, 5, job=b"job", output=b"A-LIE",
+                                vclass=P.VCLASS_NATIVE, nonce=b"n" * 16)
+        with self.assertRaises(P.WireMmidError):
+            P.challenge_receipt(forged, b"HONEST-OUTPUT")   # replay ≠ commitment
+
+    def test_float_receipt_is_not_replay_auditable(self):
+        w, r = ident(b"w2"), ident(b"r2")
+        fl = P.make_receipt(w, r, 5, job=b"j", output=b"o",
+                            vclass=P.VCLASS_FLOAT, nonce=b"n" * 16)
+        with self.assertRaises(P.ValidationError) as cm:
+            P.challenge_receipt(fl, b"o")
+        self.assertEqual(cm.exception.reason, "not-replay-class")
+
+    def test_vclass_mislabel_rejected(self):
+        # A node cannot dress float work as native to steal a vote: the record's
+        # vclass/weight_bearing must match the receipt (§3/§10).
+        led, worker, customer = fresh_pair()
+        receipt = P.make_receipt(worker, customer, 7, job=b"j", output=b"o",
+                                 vclass=P.VCLASS_FLOAT, nonce=b"m" * 16)
+        rec = P.build_settle_record(worker, led.chains[worker.account_id], receipt)
+        rec.body["weight_bearing"] = True             # the lie...
+        rec.body["vclass"] = P.VCLASS_NATIVE
+        rec.sign(worker)                              # ...re-signed over the lie
+        with self.assertRaises(P.ValidationError) as cm:
+            led.post(rec, receipt)
+        self.assertIn(cm.exception.reason, ("vclass", "weight-bearing"))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# The happy path (§10 genesis) — proved LAST, after the threats.
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestGenesisHappyPath(unittest.TestCase):
+    """§10: the testnet-of-two IS the genesis. Two fresh nodes, zero credit and
+    zero weight, do each other's work and gain weight — no faucet, no premine,
+    no coordinator."""
+
+    def test_two_nodes_bootstrap_and_a_third_cannot_vote(self):
+        led = P.Ledger()
+        a, b = ident(b"node-A"), ident(b"node-B")
+        led.open_account(a)
+        led.open_account(b)
+
+        # Fresh nodes: zero credit, zero weight (§10).
+        for n in (a, b):
+            self.assertEqual(led.balance(n.account_id), 0)
+            self.assertEqual(led.earned(n.account_id), 0)
+            self.assertEqual(led.weight(n.account_id, NOW), 0.0)
+
+        # They do each other's work (mutual SETTLE), symmetric magnitude.
+        led.settle_work(a, b, 8)          # A computed for B
+        led.settle_work(b, a, 8)          # B computed for A
+
+        # Both end with POSITIVE earned credit...
+        self.assertEqual(led.earned(a.account_id), 8)
+        self.assertEqual(led.earned(b.account_id), 8)
+        # ...and total credit across the mesh sums to ZERO (double-entry).
+        self.assertEqual(led.total_supply(), 0)
+
+        # Burning reduces total supply, monotonically (§9.5).
+        supply0 = led.total_supply()
+        led.burn(a, 3, timestamp=NOW, now=NOW)
+        supply1 = led.total_supply()
+        self.assertLess(supply1, supply0)
+        led.burn(b, 5, timestamp=NOW, now=NOW)
+        supply2 = led.total_supply()
+        self.assertLess(supply2, supply1)
+        self.assertEqual(supply2, -8)                     # −(total burned)
+
+        # Both now carry weight and may vote.
+        self.assertGreater(led.weight(a.account_id, NOW), 0.0)
+        self.assertGreater(led.weight(b.account_id, NOW), 0.0)
+        self.assertTrue(led.can_vote(a.account_id, NOW))
+        self.assertTrue(led.can_vote(b.account_id, NOW))
+
+        # A fresh third node has zero weight and CANNOT vote (§10).
+        c = ident(b"node-C")
+        led.open_account(c)
+        self.assertEqual(led.weight(c.account_id, NOW), 0.0)
+        self.assertFalse(led.can_vote(c.account_id, NOW))
+
+    def test_transfer_moves_earned_credit_and_conserves(self):
+        # TRANSFER is a first-class kind (§4/§8); prove the validator path.
+        led = P.Ledger()
+        x, y, cust = ident(b"tx-X"), ident(b"tx-Y"), ident(b"tx-cust")
+        for n in (x, y, cust):
+            led.open_account(n)
+        led.settle_work(x, cust, 30)                      # X earns 30
+        before = led.total_supply()
+        led.transfer(x, y, 12)                            # X sends 12 to Y
+        self.assertEqual(led.balance(x.account_id), 30 - 12)
+        self.assertEqual(led.balance(y.account_id), +12)
+        self.assertEqual(led.total_supply(), before)      # a transfer conserves
+
+
+class TestPersistence(unittest.TestCase):
+    """A node keeps its full ledger state across a save/reload (restart)."""
+
+    def test_ledger_roundtrips_balance_weight_and_chain(self):
+        import tempfile
+        led = P.Ledger()
+        a, cust = ident(b"saver"), ident(b"cust")
+        led.open_account(a)
+        led.open_account(cust)
+        led.settle_work(a, cust, 10)                 # a earns weight-bearing 10
+        led.burn(a, 4, timestamp=NOW, now=NOW)       # burns 4 for weight
+        path = os.path.join(tempfile.mkdtemp(), "ledger.json")
+        led.save(path)
+        back = P.Ledger.load(path)
+        self.assertEqual(back.balance(a.account_id), led.balance(a.account_id))
+        self.assertEqual(back.burnable(a.account_id), led.burnable(a.account_id))
+        self.assertEqual(back.weight(a.account_id, NOW),
+                         led.weight(a.account_id, NOW))
+        self.assertEqual(back.total_supply(), led.total_supply())
+        self.assertEqual(back.chains[a.account_id].head_id,          # chain intact
+                         led.chains[a.account_id].head_id)
+        self.assertTrue(back.verify())                              # loaded state is intact
+
+    def test_verify_detects_tampering(self):
+        led = P.Ledger()
+        a, cust = ident(b"vf-a"), ident(b"vf-cust")
+        led.open_account(a)
+        led.open_account(cust)
+        led.settle_work(a, cust, 10)
+        led.burn(a, 3, timestamp=NOW, now=NOW)
+        self.assertTrue(led.verify())                              # clean verifies
+        led.chains[a.account_id].records[1].body["amount"] = 999   # tamper
+        self.assertFalse(led.verify())                             # detected
+
+
+if __name__ == "__main__":
+    unittest.main()

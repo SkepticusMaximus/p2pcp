@@ -1,0 +1,356 @@
+"""test_p2pcp_daemon.py — the daemon skeleton: HELLO over the wire (§4/§14 step 4).
+
+Two daemons on loopback complete a signed HELLO and each ends holding the other's
+VERIFIED account_id — identity established over the wire, by signature, with no
+trust granted by the socket (§2.1). Plus the refusal paths: forged signature,
+wrong type, unknown/unimplemented alg. Imports the daemon and ledger, never
+`socket` (the one-organ boundary).
+
+Run: ``cd 5500fp && python3 -m unittest test_p2pcp_daemon``
+"""
+
+import os
+import unittest
+
+from p2pcp import daemon as D
+from p2pcp import worker as WK
+L = D.L                        # the daemon's OWN ledger module — one instance, so
+#                             # isinstance and exception classes match across the two
+
+
+def ident(tag: bytes):
+    return L.Identity.from_seed(tag.ljust(32, b"\x00"))
+
+
+class TestHandshake(unittest.TestCase):
+    """Identity over the wire — trustless, signature-verified."""
+
+    def test_two_daemons_exchange_verified_hellos(self):
+        a = D.Daemon(ident(b"node-A"))
+        b = D.Daemon(ident(b"node-B"))
+        addr = a.start()
+        try:
+            # B dials A and completes the outbound HELLO, learning A's id.
+            verified_a = b.connect(*addr)
+            self.assertEqual(verified_a, a.account_id)
+            # A's accept loop completes the inbound HELLO, learning B's id.
+            learned_b = a.next_verified_peer(timeout=5.0)
+            self.assertEqual(learned_b, b.account_id)
+            # Each holds the other, keyed by verified account_id.
+            self.assertIn(b.account_id, a.peers())
+            self.assertIn(a.account_id, b.peers())
+        finally:
+            a.stop()
+            b.stop()
+
+    def test_a_third_stranger_is_also_accepted(self):
+        # Trustless: no allow-list. A second, unrelated node connects and is
+        # verified just the same (§2.1).
+        a = D.Daemon(ident(b"hub"))
+        addr = a.start()
+        c = D.Daemon(ident(b"stranger"))
+        try:
+            self.assertEqual(c.connect(*addr), a.account_id)
+            self.assertEqual(a.next_verified_peer(timeout=5.0), c.account_id)
+        finally:
+            a.stop()
+            c.stop()
+
+
+class TestHandshakeRefusals(unittest.TestCase):
+    """A HELLO must prove key control; anything less is dropped cleanly."""
+
+    def setUp(self):
+        self.d = D.Daemon(ident(b"verifier"))
+
+    def _frame(self, account_hex, signer, alg=L.ALG_ED25519, mtype=D.HELLO_TYPE):
+        msg = {"type": mtype, "account": account_hex,
+               "nonce": os.urandom(16).hex(), "alg": alg}
+        sig = signer.sign(D._canon(msg), alg) if signer is not None else b"\x00" * 64
+        return D._canon({"msg": msg, "sig": sig.hex()})
+
+    def test_valid_hello_verifies(self):
+        who = ident(b"honest")
+        account = self.d._verify_hello(self._frame(who.account_id.hex(), who))
+        self.assertEqual(account, who.account_id)
+
+    def test_forged_signature_rejected(self):
+        # Attacker announces the victim's account but can only sign with its own.
+        victim, attacker = ident(b"victim"), ident(b"attacker")
+        frame = self._frame(victim.account_id.hex(), attacker)   # wrong key
+        with self.assertRaises(D.HandshakeError):
+            self.d._verify_hello(frame)
+
+    def test_wrong_type_rejected(self):
+        who = ident(b"honest")
+        frame = self._frame(who.account_id.hex(), who, mtype="NOT-A-HELLO")
+        with self.assertRaises(D.HandshakeError):
+            self.d._verify_hello(frame)
+
+    def test_unknown_alg_refused_gracefully(self):
+        # You cannot even SIGN with an unknown alg (the signer refuses too), so a
+        # forger sends a dummy sig; the verifier rejects on get_alg(7) first.
+        who = ident(b"honest")
+        frame = self._frame(who.account_id.hex(), None, alg=7)
+        with self.assertRaises(D.HandshakeError):     # UnknownAlg → HandshakeError
+            self.d._verify_hello(frame)
+
+    def test_unimplemented_alg_refused_gracefully(self):
+        who = ident(b"honest")
+        # alg=1 is recognized-but-stub; its verify raises AlgUnimplemented, which
+        # the handshake turns into a clean refusal, not a crash.
+        frame = self._frame(who.account_id.hex(), None, alg=L.ALG_TERNARY_NATIVE)
+        with self.assertRaises(D.HandshakeError):
+            self.d._verify_hello(frame)
+
+    def test_malformed_frame_rejected(self):
+        with self.assertRaises(D.HandshakeError):
+            self.d._verify_hello(b"{not json at all")
+
+
+class TestDaemonWiring(unittest.TestCase):
+    """The daemon owns keys + ledger + organ (RFC §4)."""
+
+    def test_owns_identity_and_ledger(self):
+        idn = ident(b"solo")
+        d = D.Daemon(idn)
+        self.assertEqual(d.account_id, idn.account_id)
+        self.assertIsInstance(d.ledger, L.Ledger)
+
+    def test_start_stop_is_clean(self):
+        d = D.Daemon(ident(b"cycle"))
+        addr = d.start()
+        self.assertEqual(addr[0], "127.0.0.1")
+        self.assertIsInstance(addr[1], int)
+        d.stop()
+        d.stop()                                       # idempotent, no hang
+
+
+class TestForwardCompat(unittest.TestCase):
+    """Capability negotiation (§15): a plain-CompuCoin node coexists with a peer
+    advertising a capability it doesn't understand — the CGP forward-compat seam.
+    NOT pre-shaping: v0.1 records the cap and ignores it, never acts on it."""
+
+    def test_unknown_capability_is_recorded_and_coexists(self):
+        base = D.Daemon(ident(b"base"))                # caps default ("compucoin",)
+        future = D.Daemon(ident(b"future"), caps=("compucoin", "citicoin"))
+        addr = base.start()
+        try:
+            self.assertEqual(future.connect(*addr), base.account_id)  # handshake OK
+            self.assertEqual(base.next_verified_peer(timeout=5.0),
+                             future.account_id)
+            # base learns future's caps but does not (cannot) act on "citicoin".
+            fc = base.peer_capabilities(future.account_id)
+            self.assertEqual(fc["version"], D.PROTOCOL_VERSION)
+            self.assertIn("citicoin", fc["caps"])
+            # future sees base as plain CompuCoin — coexistence, not rejection.
+            bc = future.peer_capabilities(base.account_id)
+            self.assertEqual(bc["caps"], ["compucoin"])
+        finally:
+            base.stop()
+            future.stop()
+
+
+class TestObservability(unittest.TestCase):
+    """Node metrics + the STATUS wire query."""
+
+    def test_stats_reports_metrics(self):
+        d = D.Daemon(ident(b"stat"))
+        s = d.stats()
+        self.assertEqual(s["account"], d.account_id.hex())
+        self.assertEqual(s["jobs_served"], 0)
+        self.assertIn("compucoin", s["caps"])
+
+    def test_fetch_status_over_the_wire(self):
+        node = D.Daemon(ident(b"stat-node"))
+        addr = node.start()
+        client = D.Daemon(ident(b"stat-client"))
+        try:
+            st = client.fetch_status(*addr)
+            self.assertEqual(st["account"], node.account_id.hex())
+            self.assertEqual(st["jobs_served"], 0)
+            self.assertIn("compucoin", st["caps"])
+        finally:
+            node.stop()
+
+    def test_jobs_and_chunks_served_counters(self):
+        wnode = D.Daemon(ident(b"served"), worker=WK.DeterministicWorker())
+        addr = wnode.start()
+        client = D.Daemon(ident(b"served-client"))
+        try:
+            client.request_job(addr[0], addr[1], b"job", n_chunks=2, k=1,
+                               vclass=L.VCLASS_NATIVE, audit=WK.DeterministicWorker())
+            self.assertEqual(wnode.stats()["jobs_served"], 1)
+            self.assertEqual(wnode.stats()["chunks_served"], 2)
+        finally:
+            wnode.stop()
+            client.stop()
+
+    def test_node_auto_advertises_its_compute_class(self):
+        # A worker node's caps mirror the adapters installed, so a peer can
+        # DISCOVER the offer from STATUS (§15) without a blind trial job.
+
+        class FloatDet(WK.DeterministicWorker):
+            vclass = WK.VCLASS_FLOAT
+
+        node = D.Daemon(ident(b"advertise"),
+                        workers=[WK.DeterministicWorker(), FloatDet()])
+        addr = node.start()
+        buyer = D.Daemon(ident(b"buyer"))
+        try:
+            caps = buyer.fetch_status(*addr)["caps"]
+            self.assertIn("compute:native", caps)      # replay-class on offer
+            self.assertIn("compute:float", caps)       # quorum-class on offer
+        finally:
+            node.stop()
+        # A buy-only node advertises neither.
+        self.assertNotIn("compute:native", D.Daemon(ident(b"buyonly")).caps)
+
+    def test_find_providers_picks_the_class_you_need(self):
+        # Two nodes on the mesh; a buyer discovers WHICH serves native — no blind
+        # trial job, just STATUS + the advertised cap.
+
+        class FloatDet(WK.DeterministicWorker):
+            vclass = WK.VCLASS_FLOAT
+
+        native = D.Daemon(ident(b"prov-native"), worker=WK.DeterministicWorker())
+        floaty = D.Daemon(ident(b"prov-float"), worker=FloatDet())
+        n_addr, f_addr = native.start(), floaty.start()
+        buyer = D.Daemon(ident(b"prov-buyer"))
+        try:
+            cands = [n_addr, f_addr, ("127.0.0.1", 1)]     # last is dead → skipped
+            self.assertEqual(buyer.find_providers("compute:native", cands), [n_addr])
+            self.assertEqual(buyer.find_providers("compute:float", cands), [f_addr])
+            self.assertEqual(buyer.find_providers("compute:native", []), [])
+        finally:
+            native.stop()
+            floaty.stop()
+
+    def test_buy_from_mesh_falls_through_a_broken_provider(self):
+        # Two native providers advertise the class; the FIRST delivers nothing
+        # (broken). buy_from_mesh skips it and settles on the second — resilience
+        # without naming a node, and the buyer still replay-audits (trustless).
+
+        class Broken(WK.DeterministicWorker):          # native cap, 0 delivered
+            def run_chunk(self, job, index):
+                raise RuntimeError("provider down")
+
+        broken = D.Daemon(ident(b"mesh-broken"), worker=Broken())
+        good = D.Daemon(ident(b"mesh-good"), worker=WK.DeterministicWorker())
+        b_addr, g_addr = broken.start(), good.start()
+        buyer = D.Daemon(ident(b"mesh-buyer"))
+        try:
+            addr, res = buyer.buy_from_mesh(
+                "compute:native", b"job", n_chunks=2, k=1, vclass=L.VCLASS_NATIVE,
+                audit=WK.DeterministicWorker(), candidates=[b_addr, g_addr])
+            self.assertEqual(addr, g_addr)             # fell through to the good one
+            self.assertEqual(res["settled_chunks"], 2)
+            self.assertEqual(good.ledger.balance(good.account_id), +2)
+            self.assertEqual(broken.ledger.balance(broken.account_id), 0)  # unpaid
+            # No provider at all → (None, None), not an exception.
+            self.assertEqual(buyer.buy_from_mesh(
+                "compute:native", b"j", 1, 1, L.VCLASS_NATIVE,
+                audit=WK.DeterministicWorker(), candidates=[]), (None, None))
+        finally:
+            broken.stop()
+            good.stop()
+
+
+class TestMalformedFrameResilience(unittest.TestCase):
+    """A malformed frame from any peer must drop that peer, NEVER the single accept
+    thread — else one bad frame is a permanent inbound DoS (trustless accept §2.1)."""
+
+    def _send_raw(self, client, host, port, frame):
+        peer = client.organ.connect(host, port, timeout=client.timeout)
+        try:
+            client._handshake_outbound(peer)
+            peer.send(D.W.encode(frame))
+        finally:
+            peer.close()
+
+    def _send_bytes(self, client, host, port, raw):
+        peer = client.organ.connect(host, port, timeout=client.timeout)
+        try:
+            client._handshake_outbound(peer)
+            peer.send(raw)                             # arbitrary, un-encoded payload
+        finally:
+            peer.close()
+
+    def test_malformed_frames_do_not_kill_the_accept_thread(self):
+        W = D.W
+        node = D.Daemon(ident(b"resilient"), worker=WK.DeterministicWorker())
+        addr = node.start()
+        attacker = D.Daemon(ident(b"malformer"))
+        probe = D.Daemon(ident(b"prober"))
+        try:
+            for bad in ({"t": W.VOTE},                     # no 'vote' → KeyError
+                        {"t": W.RECORD},                   # no 'record' → KeyError
+                        {"t": W.JOB, "job": "zz"},         # bad hex → ValueError
+                        {"t": W.JOB}):                     # no 'job' → KeyError
+                self._send_raw(attacker, addr[0], addr[1], bad)
+            for raw in (b"[1,2,3]", b"42", b'"hi"', b"garbage", b"\xff\xff"):
+                self._send_bytes(attacker, addr[0], addr[1], raw)   # non-dict payloads
+            # The node still serves — the accept thread survived every bad frame.
+            st = probe.fetch_status(*addr)
+            self.assertEqual(st["account"], node.account_id.hex())
+            # ...and a real paid job still settles afterward.
+            res = probe.request_job(addr[0], addr[1], b"job", 1, 2,
+                                    vclass=L.VCLASS_NATIVE,
+                                    audit=WK.DeterministicWorker())
+            self.assertEqual(res["settled_chunks"], 1)
+        finally:
+            node.stop()
+            attacker.stop()
+            probe.stop()
+
+
+class TestLedgerConcurrency(unittest.TestCase):
+    """A node that BOTH serves and buys posts to its own chain from two threads;
+    serialized ledger mutation must keep the chain fork-free (§5)."""
+
+    def test_concurrent_serve_and_buy_does_not_self_fork(self):
+        import threading as T
+        A = D.Daemon(ident(b"both-A"), worker=WK.DeterministicWorker())
+        B = D.Daemon(ident(b"both-B"), worker=WK.DeterministicWorker())
+        a_addr, b_addr = A.start(), B.start()
+        C = D.Daemon(ident(b"buyer-C"))
+        errors = []
+
+        def buy_from_A():                              # A serves → A's accept thread posts
+            try:
+                for _ in range(5):
+                    C.request_job(a_addr[0], a_addr[1], b"j", 1, 1,
+                                  vclass=L.VCLASS_NATIVE,
+                                  audit=WK.DeterministicWorker())
+            except Exception as e:                     # noqa: BLE001
+                errors.append(e)
+
+        def A_buys_B():                                # A buys → A's caller thread posts
+            try:
+                for _ in range(5):
+                    A.request_job(b_addr[0], b_addr[1], b"j", 1, 1,
+                                  vclass=L.VCLASS_NATIVE,
+                                  audit=WK.DeterministicWorker())
+            except Exception as e:                     # noqa: BLE001
+                errors.append(e)
+
+        threads = ([T.Thread(target=buy_from_A) for _ in range(3)]
+                   + [T.Thread(target=A_buys_B) for _ in range(3)])
+        try:
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self.assertEqual(errors, [])               # no exception bubbled up
+            # A's chain took posts from its accept thread AND three buyer threads —
+            # it must still verify (no self-fork) and reload cleanly.
+            self.assertTrue(A.ledger.chains[A.account_id].verify())
+            self.assertTrue(A.ledger.verify())
+        finally:
+            A.stop()
+            B.stop()
+            C.stop()
+
+
+if __name__ == "__main__":
+    unittest.main()
