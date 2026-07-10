@@ -1,0 +1,108 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>p2pcp — buy compute from your browser</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { color-scheme: dark; }
+  body { background:#0f1115; color:#d7dae0; font:14px/1.6 ui-monospace,Menlo,Consolas,monospace;
+         max-width:760px; margin:0 auto; padding:24px; }
+  h1 { font-size:20px; font-weight:500; margin:0 0 4px; }
+  .sub { color:#8a919e; margin:0 0 20px; }
+  fieldset { border:1px solid #262b36; border-radius:8px; margin:0 0 16px; padding:12px 14px; }
+  legend { color:#8a919e; padding:0 6px; }
+  label { display:block; color:#8a919e; margin:8px 0 2px; }
+  input { width:100%; box-sizing:border-box; background:#0a0c10; color:#d7dae0;
+          border:1px solid #262b36; border-radius:6px; padding:7px 9px; font:inherit; }
+  .row { display:flex; gap:10px; } .row > * { flex:1; }
+  button { background:#2b6cb0; color:#fff; border:0; border-radius:6px; padding:9px 16px;
+           font:inherit; cursor:pointer; margin-top:12px; }
+  button:disabled { opacity:.5; cursor:default; }
+  pre { background:#0a0c10; border:1px solid #262b36; border-radius:6px; padding:12px;
+        white-space:pre-wrap; word-break:break-word; min-height:24px; }
+  .ok { color:#68b984; } .err { color:#e06c75; } .dim { color:#8a919e; }
+  code { color:#d19a66; }
+</style>
+
+<h1>Your stall on the CompuCoin market</h1>
+<p class="sub">Buy compute from a stranger's computer, straight from this browser tab —
+paying in CompuCoin, with no company in the middle. Your keys never leave this page.</p>
+
+<fieldset>
+  <legend>where to buy</legend>
+  <label>gateway (WebSocket bridge)</label>
+  <input id="gw" value="ws://127.0.0.1:8800">
+  <div class="row">
+    <div><label>seller host</label><input id="host" value="127.0.0.1"></div>
+    <div><label>seller port</label><input id="port" value="9000"></div>
+    <div><label>price (CompuCoin)</label><input id="k" value="5"></div>
+  </div>
+  <label>your job</label>
+  <input id="job" value="hello from the browser">
+  <button id="buy">Buy (float)</button>
+</fieldset>
+
+<fieldset>
+  <legend>result</legend>
+  <pre id="out" class="dim">Run a float seller and the gateway first (see below), then press Buy.</pre>
+</fieldset>
+
+<p class="dim">To try it locally:<br>
+&nbsp;&nbsp;<code>p2pcp serve --worker mymod:myfn --float --port 9000</code>&nbsp;&nbsp;(a float seller)<br>
+&nbsp;&nbsp;<code>p2pcp-gateway --port 8800</code>&nbsp;&nbsp;(the bridge; needs <code>pip install 'p2pcp[gateway]'</code>)<br>
+A browser can be a buyer but not a full seller — it can't listen for inbound jobs.</p>
+
+<script type="importmap">
+{ "imports": {
+  "@noble/hashes/sha3": "https://esm.sh/@noble/hashes@1.5.0/sha3",
+  "@noble/hashes/sha512": "https://esm.sh/@noble/hashes@1.5.0/sha512",
+  "@noble/ed25519": "https://esm.sh/@noble/ed25519@2.1.0"
+}}
+</script>
+<script type="module">
+  import { Buyer, newIdentity } from './p2pcp.js';
+
+  function connect(url) {
+    const ws = new WebSocket(url);
+    const q = [], w = [];
+    ws.onmessage = e => {
+      const s = typeof e.data === 'string' ? e.data : '';
+      if (w.length) w.shift()(s); else q.push(s);
+    };
+    return new Promise((resolve, reject) => {
+      ws.onerror = () => reject(new Error('cannot reach gateway'));
+      ws.onopen = () => resolve({
+        send: s => ws.send(s),
+        recv: () => q.length ? Promise.resolve(q.shift()) : new Promise(r => w.push(r)),
+        close: () => ws.close(),
+      });
+    });
+  }
+
+  const $ = id => document.getElementById(id);
+  const out = $('out');
+
+  $('buy').onclick = async () => {
+    $('buy').disabled = true;
+    out.className = 'dim';
+    out.textContent = 'connecting…';
+    let t;
+    try {
+      const gw = $('gw').value.trim();
+      const target = `${$('host').value.trim()}:${$('port').value.trim()}`;
+      t = await connect(`${gw}/?target=${target}`);
+      out.textContent = 'buying…';
+      const buyer = new Buyer(await newIdentity());
+      const job = new TextEncoder().encode($('job').value);
+      const r = await buyer.buyFloat(t, job, Number($('k').value));
+      out.className = 'ok';
+      out.textContent = `${r.output}\n\n— paid ${r.paid} CompuCoin to `
+                      + `${r.worker.slice(0, 16)}…`;
+    } catch (e) {
+      out.className = 'err';
+      out.textContent = 'failed: ' + e.message;
+    } finally {
+      if (t) t.close();
+      $('buy').disabled = false;
+    }
+  };
+</script>
