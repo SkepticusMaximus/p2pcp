@@ -95,6 +95,25 @@ One paid job, chunk by chunk:
 Exposure is bounded to one chunk, and a forged result is refused at step 3 before
 payment. Float work (which can't be re-run bit-for-bit) rides redundancy instead.
 
+## In the browser
+
+A browser can't open a raw socket, so it reaches the mesh through the WebSocket
+gateway and buys with a small JS client that speaks the wire byte-for-byte with the
+Python core (same canonical JSON, SHA3-256 digests, ed25519 signatures — a Python
+seller accepts a browser's receipts). Keys stay in the tab; the gateway is a dumb,
+keyless pipe.
+
+```
+pip install 'p2pcp[gateway]'
+p2pcp-gateway --port 8800                 # the WebSocket <-> TCP bridge
+# then serve a float seller and open web/index.html in a browser
+```
+
+`web/p2pcp.js` is the client (buyer); `web/index.html` is a demo page. A browser is
+buyer/light-only — it can't listen for inbound jobs, so it never sells. Interop is
+proven in `tests/test_js_interop.py`: the JS canon/digest/signing bytes match Python
+exactly, and a real Node buyer settles a float job through the gateway.
+
 ## The one organ
 
 Exactly one module — `p2pcp/organ.py` — is allowed to import the network. Every
@@ -109,7 +128,7 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 
 ## Status
 
-v0.1 core, extracted standalone and green (134 tests on loopback). Next: an
-in-browser light client (buyer) over a WebSocket gateway — a browser can't be a full
-peer, so it stays buyer/light-only. **License:** to be chosen by the project owner
-before public release.
+v0.1 core, extracted standalone and green (142 tests on loopback). Runs three ways:
+a native node (`p2pcp`), a headless cloud node (Docker), and an in-browser buyer
+(gateway + `web/`). **License:** to be chosen by the project owner before public
+release.
