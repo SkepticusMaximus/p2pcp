@@ -130,5 +130,4 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 
 v0.1 core, extracted standalone and green (142 tests on loopback). Runs three ways:
 a native node (`p2pcp`), a headless cloud node (Docker), and an in-browser buyer
-(gateway + `web/`). **License:** to be chosen by the project owner before public
-release.
+(gateway + `web/`). **License:** GNU GPL v3 or later — see [LICENSE](LICENSE).
