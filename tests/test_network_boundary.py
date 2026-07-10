@@ -33,6 +33,15 @@ NETWORK_MODULES = {
 # one-limb rule, enforced by CI: you cannot grow a second organ.
 NETWORK_ALLOWLIST = {"organ"}   # the ONE organ (§1.5)
 
+# Bridges: network-facing by nature, but OUTSIDE the trustless core, so exempt from
+# the one-organ rule. `gateway` is the optional WebSocket<->TCP bridge for browser
+# clients — it must exist to span two transports. Its exemption is safe only because
+# it is a DUMB, keyless pipe: it imports no ledger/consensus/daemon, holds no key,
+# and shuttles opaque frames, so it cannot forge a receipt or spend a coin. That
+# "dumb pipe" property is itself asserted below, so the exemption can't be abused.
+BRIDGE_EXEMPT = {"gateway"}
+TRUST_MODULES = {"ledger", "consensus", "daemon", "worker"}  # keys / money / protocol
+
 # The package scanned — the whole p2pcp package, not one module.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 PKG_DIR = os.path.join(os.path.dirname(_HERE), "p2pcp")
@@ -88,7 +97,7 @@ class TestNetworkBoundary(unittest.TestCase):
                 if not f.endswith(".py"):
                     continue
                 path = os.path.join(dp, f)
-                if _module_stem(path) in NETWORK_ALLOWLIST:
+                if _module_stem(path) in NETWORK_ALLOWLIST | BRIDGE_EXEMPT:
                     continue
                 nets = _network_imports(path)
                 if nets:
@@ -98,6 +107,25 @@ class TestNetworkBoundary(unittest.TestCase):
             "modules outside the one-organ allow-list import the network "
             f"(§1.5): {offenders}. Only `organ` may touch the wire; otherwise the "
             "limb has grown a second head.")
+
+    def test_bridges_are_dumb_keyless_pipes(self):
+        # A bridge's network exemption is only safe if it carries NO trust logic:
+        # importing the ledger/consensus/daemon/worker would give it keys or protocol
+        # authority it could abuse. Prove each exempt bridge imports none of them.
+        for name in BRIDGE_EXEMPT:
+            path = os.path.join(PKG_DIR, name + ".py")
+            self.assertTrue(os.path.isfile(path), f"exempt bridge {name!r} missing")
+            with open(path, encoding="utf-8") as fh:
+                tree = ast.parse(fh.read())
+            trust = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.level > 0:
+                    if _top(node.module) in TRUST_MODULES:
+                        trust.add(_top(node.module))
+            self.assertEqual(
+                trust, set(),
+                f"bridge {name!r} imports trust modules {sorted(trust)} — a bridge "
+                "must be a dumb, keyless pipe to keep its network exemption safe.")
 
     def test_the_one_organ_actually_imports_the_network(self):
         # A stale allow-list entry (organ renamed/removed) silently disables the

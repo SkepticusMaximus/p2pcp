@@ -13,8 +13,13 @@ authors = [{ name = "Stevo (SkepticusMaximus)" }]
 keywords = ["p2p", "compute", "mesh", "ledger", "compucoin", "trustless", "ed25519"]
 # license: intentionally unset — the project owner picks this (see README "Status").
 
+[project.optional-dependencies]
+# the browser bridge: pip install 'p2pcp[gateway]'
+gateway = ["websockets>=10"]
+
 [project.scripts]
 p2pcp = "p2pcp.cli:main"
+p2pcp-gateway = "p2pcp.gateway:main"
 
 [tool.setuptools.packages.find]
 include = ["p2pcp*"]
