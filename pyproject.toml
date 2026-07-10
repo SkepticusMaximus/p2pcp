@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "p2pcp"
+version = "0.1.0"
+description = "A trustless peer-to-peer compute mesh with a mutual-credit ledger (CompuCoin)."
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = ["PyNaCl>=1.5"]
+authors = [{ name = "Stevo (SkepticusMaximus)" }]
+keywords = ["p2p", "compute", "mesh", "ledger", "compucoin", "trustless", "ed25519"]
+# license: intentionally unset — the project owner picks this (see README "Status").
+
+[project.scripts]
+p2pcp = "p2pcp.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["p2pcp*"]
