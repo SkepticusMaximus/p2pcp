@@ -120,6 +120,27 @@ Exactly one module — `p2pcp/organ.py` — is allowed to import the network. Ev
 other module is forbidden, and a test (`tests/test_network_boundary.py`) proves it
 by walking the imports. The network is a single narrow, auditable surface.
 
+## Vector Manifold — share training, not just inference (`p2pcp.manifold`)
+
+A SECOND protocol on the same wire: peers share *training manifolds* — the
+patterns their weights are converging on — as graphable objects, fold each
+other's in, and converge. It runs as a negotiated capability
+(`caps: [..., "manifold"]`), routed by frame type (`MFOLD_*`) on the same socket
+as compute: **one port, two protocols, no clash** — a protocol is identified by
+its handshake and frame types, never its port number.
+
+```
+python3 -m p2pcp.manifold_demo      # watch two trainers converge (MMOE -> 0)
+```
+
+Pipeline: a pattern -> one typed curve per dimension (linear/exp/poly) ->
+rendered (PIGART) -> packetised as MAP words -> DIF'd + rated (MMID vs MMOE) ->
+precision-weighted (Bayesian) re-stage -> iterate. TernOO-native by design: it is
+the Words, not the bytes, so a non-ternary node cannot participate by proxy.
+Design memo + open questions (curve encoding, MMOE definition, verification class,
+poisoning/trust model): TernOO-5500FP
+`private/docs-bench/drafts/2026-07-27-vector-manifold-design-v0.1.md`.
+
 ## Run the tests
 
 ```
