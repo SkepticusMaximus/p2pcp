@@ -164,6 +164,7 @@ class Daemon:
         self._peer_caps = {}                   # account -> {version, caps} (§15)
         self._jobs_served = 0                  # observability counters
         self._chunks_served = 0
+        self._ledger_rev = 0                   # bumps on every chain mutation → autosave trigger
         self.max_unpaid_per_peer = MAX_UNPAID_PER_PEER
         self._unpaid = {}                      # requester_id -> delivered-unsettled (§9.1)
         self.trust_grant_per = TRUST_GRANT_PER
@@ -330,6 +331,20 @@ class Daemon:
             chain = self.ledger.chains[self.account_id]
             self.ledger.post(L.build_settle_record(self.identity, chain, receipt,
                                                    self.alg), receipt)
+            self._ledger_rev += 1              # ledger changed → mark for autosave
+
+    def ledger_rev(self):
+        """Revision counter — bumps on every chain mutation, so a supervisor can
+        autosave only when the ledger actually changed (no idle disk churn)."""
+        return self._ledger_rev
+
+    def save_ledger(self, path):
+        """Persist the ledger to `path` under the chain lock, so an in-flight
+        settlement can't produce a half-written snapshot. Lets a long-running node
+        flush earnings WHILE serving — not only on a clean exit (the old bug: a
+        systemd service never reached the finally-save, so `wallet` always read 0)."""
+        with self._ledger_lock:
+            self.ledger.save(path)
 
     # -- worker role (runs in the accept loop, after inbound HELLO) ------------
     def _serve_peer(self, peer, peer_id):
@@ -563,8 +578,10 @@ class Daemon:
         ts = int(time.time()) if timestamp is None else timestamp
         nw = ts if now is None else now
         with self._ledger_lock:                # serialize with settle posts (§5)
-            return self.ledger.burn(self.identity, amount, timestamp=ts, now=nw,
-                                    alg=self.alg)
+            rec = self.ledger.burn(self.identity, amount, timestamp=ts, now=nw,
+                                   alg=self.alg)
+            self._ledger_rev += 1              # ledger changed → mark for autosave
+            return rec
 
     def my_weight(self, now=None):
         """Our own decayed-burn voting weight at `now` (§6/§10) — 0 until we burn."""

@@ -9,6 +9,7 @@ No platform-specific models — those are plugins that drop in behind WorkerAdap
 import hashlib
 import json
 import os
+import signal
 import threading
 import time
 
@@ -16,6 +17,15 @@ from . import daemon as D
 from . import worker as WK
 
 L = D.L                                    # the ledger module (Identity, Ledger, …)
+
+AUTOSAVE_SECS = 3                           # how often a running node flushes its ledger
+
+
+def _raise_kbd(*_):
+    """SIGTERM handler → raise KeyboardInterrupt in the main thread, so a managed
+    stop (systemctl stop / SIGTERM) unwinds through serve()'s finally and flushes
+    the ledger, exactly like Ctrl-C does."""
+    raise KeyboardInterrupt
 
 
 def identity_from_seed(seed):
@@ -133,15 +143,41 @@ def serve(worker, host="127.0.0.1", port=0, seed="node", keyfile=None, peers=Non
         join_mesh(node, peers)
     if peers or (peers_path and os.path.exists(peers_path)):
         print(f"[{label}] mesh: know {len(node.known_peers())} peer(s)", flush=True)
+    # Persist earnings WHILE running, not only on a clean exit. A systemd service
+    # never reached the old finally-only save, so earnings stayed in RAM and the
+    # separate `wallet` process always read 0. (1) autosave the ledger whenever it
+    # changes; (2) treat SIGTERM (systemctl stop) like Ctrl-C so a managed stop
+    # also flushes.
+    stop_autosave = threading.Event()
+
+    def _autosave():
+        last = -1
+        while not stop_autosave.wait(AUTOSAVE_SECS):
+            rev = node.ledger_rev()
+            if rev != last:
+                try:
+                    node.save_ledger(ledger_path)
+                    last = rev
+                except Exception:              # a transient FS error must not kill the node
+                    pass
+    if ledger_path:
+        threading.Thread(target=_autosave, name="p2pcp-autosave",
+                         daemon=True).start()
+    try:
+        signal.signal(signal.SIGTERM, _raise_kbd)
+    except (ValueError, OSError):
+        pass                                   # not main thread / platform quirk — non-fatal
+
     print(f"[{label}] Ctrl-C to stop.", flush=True)
     try:
         threading.Event().wait()
     except KeyboardInterrupt:
         pass
     finally:
+        stop_autosave.set()
         node.stop()
         if ledger_path:
-            node.ledger.save(ledger_path)
+            node.save_ledger(ledger_path)      # final flush, under the chain lock
         if peers_path:
             node.save_peers(peers_path)
         earned = (node.ledger.balance(node.account_id)
