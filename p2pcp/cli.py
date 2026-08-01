@@ -44,7 +44,7 @@ def _buy(args):
         peers=node.parse_peers(args.peers) if args.peers else None,
         chunks=args.chunks, k=args.k,
         vclass="float" if args.float_ else "native",
-        audit_worker=args.worker, seed=args.seed)
+        audit_worker=args.worker, seed=args.seed, timeout=args.timeout)
     try:
         if res is None or res.get("settled_chunks", 0) < 1:
             print("[buy] nothing settled (node offline, refused, or audit failed).",
@@ -122,6 +122,8 @@ def build_parser():
     pb.add_argument("--worker", default="demo",
                     help="mod:callable to replay-audit native work (default: demo)")
     pb.add_argument("--seed", default="buyer")
+    pb.add_argument("--timeout", type=float,
+                    help="wire-recv timeout in seconds (default: 240 float, 15 native)")
     pb.set_defaults(fn=_buy)
 
     pw = sub.add_parser("wallet", help="show account + CompuCoin + voting weight")

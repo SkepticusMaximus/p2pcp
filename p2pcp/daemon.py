@@ -225,10 +225,13 @@ class Daemon:
 
     def _record(self, account_id: bytes, peer):
         with self._lock:
-            old = self._peers.get(account_id)
-            self._peers[account_id] = peer
-        if old is not None and old is not peer:
-            old.close()                        # a reconnect replaces & closes the old
+            self._peers[account_id] = peer     # latest connection wins for lookup
+        # A replaced peer is NOT closed here: with concurrent connections (thread-
+        # per-peer serving, parallel buyers) one account legitimately holds several
+        # live sockets at once, and closing the superseded one kills an exchange
+        # mid-flight in another thread (EBADF). Every socket has ONE owner who
+        # closes it: serve threads in _serve_peer_safe's finally, requesters in
+        # request_job's finally, and stop() sweeps whatever remains.
         self._events.put(account_id)
 
     # ── HELLO handshake (§4 wire, identity only) ─────────────────────────────
@@ -301,14 +304,26 @@ class Daemon:
                 break                          # organ closed → stop() in progress
             try:
                 account = self._handshake_inbound(peer)
-                self._serve_peer(peer, account)
-            except (HandshakeError, SOCK.OrganError):
+            except (HandshakeError, SOCK.OrganError, Exception):  # noqa: BLE001
                 peer.close()                   # a stranger who fails HELLO is dropped
-            except Exception:                  # noqa: BLE001
-                # A malformed frame from ANYONE (trustless accept, §2.1) must drop
-                # that peer, NEVER the single accept thread — else one bad frame is a
-                # permanent inbound DoS. Contain per-peer faults here.
-                peer.close()
+                continue
+            # Serve each verified peer on its OWN thread: a slow job (real model
+            # inference takes tens of seconds) must not deafen the node — STATUS,
+            # the dashboard, and other buyers keep getting answered while a chunk
+            # computes. The ledger/lock discipline (_lock/_ledger_lock) already
+            # serializes the shared state, so concurrent peers are safe.
+            threading.Thread(target=self._serve_peer_safe, args=(peer, account),
+                             name="p2pcp-peer", daemon=True).start()
+
+    def _serve_peer_safe(self, peer, account):
+        """_serve_peer with per-peer fault containment (one bad/hostile peer must
+        drop THAT peer only, never wound the node)."""
+        try:
+            self._serve_peer(peer, account)
+        except Exception:                      # noqa: BLE001
+            pass
+        finally:
+            peer.close()
 
     # ── the wire contract (§4 L2 / §14 step 5) ───────────────────────────────
     # The PAID job. A requester streams a JOB; the worker runs it through its

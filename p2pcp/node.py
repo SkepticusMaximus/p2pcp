@@ -187,8 +187,12 @@ def serve(worker, host="127.0.0.1", port=0, seed="node", keyfile=None, peers=Non
 
 # ── buying compute ───────────────────────────────────────────────────────────
 
+MODEL_BUY_TIMEOUT = 240.0     # float work = real inference; give the model time
+NATIVE_BUY_TIMEOUT = 15.0
+
+
 def buy(job, host=None, port=None, peers=None, chunks=1, k=3, vclass="native",
-        audit_worker="demo", seed="buyer"):
+        audit_worker="demo", seed="buyer", timeout=None):
     """Buy compute. Native work is REPLAY-AUDITED with `audit_worker` (the same
     callable the seller runs) — you pay only for chunks you re-derive bit-for-bit.
     Float work is taken on trust of quorum (audit=None). Give a specific `host`/
@@ -197,7 +201,9 @@ def buy(job, host=None, port=None, peers=None, chunks=1, k=3, vclass="native",
     vc = L.VCLASS_FLOAT if vclass == "float" else L.VCLASS_NATIVE
     audit = None if vc == L.VCLASS_FLOAT else load_worker(audit_worker,
                                                           vclass=vclass)
-    client = D.Daemon(identity_from_seed(seed))
+    if timeout is None:      # a model needs thinking time; the demo answers instantly
+        timeout = MODEL_BUY_TIMEOUT if vc == L.VCLASS_FLOAT else NATIVE_BUY_TIMEOUT
+    client = D.Daemon(identity_from_seed(seed), timeout=timeout)
     job_bytes = job if isinstance(job, (bytes, bytearray)) else str(job).encode()
     if peers:
         cap = "compute:float" if vc == L.VCLASS_FLOAT else "compute:native"

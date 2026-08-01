@@ -39,7 +39,12 @@ NETWORK_ALLOWLIST = {"organ"}   # the ONE organ (§1.5)
 # it is a DUMB, keyless pipe: it imports no ledger/consensus/daemon, holds no key,
 # and shuttles opaque frames, so it cannot forge a receipt or spend a coin. That
 # "dumb pipe" property is itself asserted below, so the exemption can't be abused.
-BRIDGE_EXEMPT = {"gateway"}
+# `model_worker` is the same species on the other side: a backend ADAPTER that
+# forwards a job to the operator's OWN local model server (Ollama / an OpenAI-
+# compatible llama.cpp) over localhost HTTP. It never speaks the P2PCP wire — not
+# a second mesh organ — and like gateway it is keyless and trust-free (imports no
+# ledger/consensus/daemon/worker), which the same assertion below proves for it.
+BRIDGE_EXEMPT = {"gateway", "model_worker"}
 TRUST_MODULES = {"ledger", "consensus", "daemon", "worker"}  # keys / money / protocol
 
 # The package scanned — the whole p2pcp package, not one module.
