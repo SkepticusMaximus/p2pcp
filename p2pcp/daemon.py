@@ -783,7 +783,13 @@ class Daemon:
         s = self.stats()
         public = {"account": s["account"], "version": s["version"],
                   "caps": s["caps"], "workers": s["workers"],
-                  "peers": s["peers"], "jobs_served": s["jobs_served"]}
+                  "peers": s["peers"], "jobs_served": s["jobs_served"],
+                  # Observability: balance/chunks are derivable from the public
+                  # (gossiped) block-lattice anyway, so exposing them in STATUS is
+                  # convenience, not a new leak — it lets a mesh watcher see a
+                  # node's earnings over the wire without its keyfile.
+                  "chunks_served": s["chunks_served"],
+                  "balance": s["balance"], "weight_bearing": s["weight_bearing"]}
         try:
             peer.send(W.encode({"t": W.STATUS, "status": public}))
         except SOCK.OrganError:
