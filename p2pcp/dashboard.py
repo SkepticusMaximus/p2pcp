@@ -115,8 +115,8 @@ def main(argv=None):
 
     root = tk.Tk()
     root.title("P2PCP — CompuCoin mesh monitor")
-    root.geometry("640x150")
-    root.minsize(460, 130)
+    root.geometry("860x620")
+    root.minsize(600, 420)
     root.configure(bg=BG)
 
     tk.Label(root, text="⚫🟢  CompuCoin mesh — live", bg=BG, fg=FG,
