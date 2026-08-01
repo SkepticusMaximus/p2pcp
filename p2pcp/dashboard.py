@@ -12,6 +12,7 @@ over the network (STATUS carries balance/jobs/chunks), so it needs no keyfile.
 Run it from the p2pcp venv (needs tkinter → system python3-tk):
     ~/.venvs/p2pcp/bin/python -m p2pcp.dashboard 10.28.135.251:9000
 """
+import os
 import sys
 import threading
 import time
@@ -100,14 +101,16 @@ class LoadGen:
         self._thread = None
         self._stop = threading.Event()
         self.target = None
+        self.caps = []
         self.buys = 0
 
     def running(self):
         return self._thread is not None and self._thread.is_alive()
 
-    def start(self, host, port):
+    def start(self, host, port, caps=()):
         self.stop()
         self.target = (host, int(port))
+        self.caps = list(caps)
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -118,19 +121,43 @@ class LoadGen:
 
     def _run(self):
         host, port = self.target
+        addr = f"{host}:{port}"
+        # Buy the class the node actually SELLS. A model node sells float, so a
+        # native load buy settles nothing and its meter reads 0 — the bug the old
+        # flat native buy hit. buy_once reads the node's caps and picks: float →
+        # the model (one answer at a time), native → the demo worker (a flood).
+        # Either way the meter climbs and coins move for real. Short prompt +
+        # k=1 keeps each draw cheap.
         while not self._stop.is_set():
             try:
-                N.buy(f"dashboard-load-{self.buys}", host=host, port=port,
-                      chunks=2, k=2)
+                buy_once(addr, "ping", self.caps, k=1)
                 self.buys += 1
             except Exception:
                 self._stop.wait(0.5)          # a blip: back off, don't spin
             self._stop.wait(0.3)              # gentle pacing
 
 
+def _configured_nodes():
+    """Nodes to watch when none are named on the CLI: one host:port per line in
+    ~/.p2pcp/nodes.txt (blank lines and #comments skipped). This is what lets the
+    dashboard open from a double-click with no arguments. Falls back to loopback."""
+    path = os.path.expanduser("~/.p2pcp/nodes.txt")
+    out = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].strip()
+                if line:
+                    out.append(line)
+    except OSError:
+        pass
+    return out or ["127.0.0.1:9000"]
+
+
 def main(argv=None):
     import tkinter as tk
-    addrs = list(argv if argv is not None else sys.argv[1:]) or ["127.0.0.1:9000"]
+    cli = list(argv if argv is not None else sys.argv[1:])
+    addrs = cli or _configured_nodes()
     states = [NodeState(a) for a in addrs]
     load = LoadGen()
 
@@ -186,8 +213,11 @@ def main(argv=None):
             btn.config(text="▶ Draw load")
             stat.config(text="idle", fg=DIM)
         else:
-            host, _, port = sel.get().rpartition(":")
-            load.start(host or "127.0.0.1", int(port or 9000))
+            addr = sel.get()
+            st = next((s for s in states if s.addr == addr), None)
+            host, _, port = addr.rpartition(":")
+            load.start(host or "127.0.0.1", int(port or 9000),
+                       st.caps if st else ())
             btn.config(text="■ Stop load")
             stat.config(text="drawing load — coins flowing", fg=GRN)
 
@@ -247,6 +277,29 @@ def main(argv=None):
                        fg="#fff", font=mono, relief="flat",
                        activebackground=GRN)
     buybtn.pack(side="left")
+
+    def do_export():
+        from tkinter import filedialog
+        log = ans.get("1.0", "end").rstrip()
+        if not log:
+            show_answer("(nothing to export yet — ask something first)", DIM)
+            return
+        path = filedialog.asksaveasfilename(
+            parent=root, title="Export mesh chat", defaultextension=".txt",
+            initialfile="compucoin-chat.txt",
+            filetypes=[("Text", "*.txt"), ("All files", "*")])
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(log + "\n")
+            show_answer(f"(exported {len(log)} chars → {path})", GRN)
+        except OSError as e:
+            show_answer(f"(export failed: {e})", RED)
+
+    exportbtn = tk.Button(trade, text="Export ⬇", command=do_export, bg=PANEL,
+                          fg=FG, font=mono, relief="flat", activebackground=ACC)
+    exportbtn.pack(side="left", padx=(6, 0))
     prompt.bind("<Return>", lambda e: do_buy())
 
     def tick():
