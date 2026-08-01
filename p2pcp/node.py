@@ -15,6 +15,7 @@ import time
 
 from . import daemon as D
 from . import worker as WK
+from . import wire as W
 
 L = D.L                                    # the ledger module (Identity, Ledger, …)
 
@@ -70,6 +71,14 @@ def parse_peers(peers_csv):
     return out
 
 
+def split_addr(addr):
+    """'host:port' (or a (host, port) tuple) -> (host, int(port))."""
+    if isinstance(addr, (tuple, list)):
+        return addr[0], int(addr[1])
+    host, _, port = str(addr).rpartition(":")
+    return (host or "127.0.0.1"), int(port)
+
+
 def join_mesh(node, peers):
     """Seed the peer book from bootstrap peers, then discover more (a dead seed is
     skipped). Returns the peer count now known."""
@@ -117,10 +126,12 @@ def _load_verified_ledger(ledger_path):
 
 
 def serve(worker, host="127.0.0.1", port=0, seed="node", keyfile=None, peers=None,
-          label="node"):
+          label="node", relay=None, relay_secret=None, relay_pool=4):
     """Run a worker node until interrupted — it sells compute for CompuCoin.
     `keyfile` persists identity + earnings + peer book across restarts; `peers`
-    bootstraps into a mesh."""
+    bootstraps into a mesh. `relay` (host:port of a p2pcp.relay) makes the node
+    sellable from behind NAT: it parks `relay_pool` outbound connections there so
+    buyers can reach it through the relay without an inbound-reachable address."""
     identity = node_identity(seed, keyfile)
     ledger_path = (keyfile + ".ledger") if keyfile else None
     ledger = None
@@ -143,6 +154,15 @@ def serve(worker, host="127.0.0.1", port=0, seed="node", keyfile=None, peers=Non
         join_mesh(node, peers)
     if peers or (peers_path and os.path.exists(peers_path)):
         print(f"[{label}] mesh: know {len(node.known_peers())} peer(s)", flush=True)
+    # Break out of NAT: park a pool of outbound connections at a relay so buyers
+    # can reach us without an inbound-reachable address. Off unless --relay given.
+    reverse_stop = None
+    if relay:
+        rh, rp = split_addr(relay)
+        reverse_stop = node.serve_reverse(rh, rp, secret=relay_secret,
+                                          pool=relay_pool)
+        print(f"[{label}] reverse: parking {relay_pool} conn(s) at relay "
+              f"{rh}:{rp} — sellable from behind NAT", flush=True)
     # Persist earnings WHILE running, not only on a clean exit. A systemd service
     # never reached the old finally-only save, so earnings stayed in RAM and the
     # separate `wallet` process always read 0. (1) autosave the ledger whenever it
@@ -175,6 +195,8 @@ def serve(worker, host="127.0.0.1", port=0, seed="node", keyfile=None, peers=Non
         pass
     finally:
         stop_autosave.set()
+        if reverse_stop is not None:
+            reverse_stop()                     # end the relay pool (daemon threads)
         node.stop()
         if ledger_path:
             node.save_ledger(ledger_path)      # final flush, under the chain lock
@@ -192,12 +214,14 @@ NATIVE_BUY_TIMEOUT = 15.0
 
 
 def buy(job, host=None, port=None, peers=None, chunks=1, k=3, vclass="native",
-        audit_worker="demo", seed="buyer", timeout=None):
+        audit_worker="demo", seed="buyer", timeout=None, via_relay=None,
+        relay_secret=None):
     """Buy compute. Native work is REPLAY-AUDITED with `audit_worker` (the same
     callable the seller runs) — you pay only for chunks you re-derive bit-for-bit.
     Float work is taken on trust of quorum (audit=None). Give a specific `host`/
     `port`, or `peers` to discover a provider for the class and fall through if one
-    is down. Returns (client_daemon, served_addr_or_None, result)."""
+    is down, or `via_relay` (host:port of a p2pcp.relay) to reach a NAT'd provider
+    parked there. Returns (client_daemon, served_addr_or_None, result)."""
     vc = L.VCLASS_FLOAT if vclass == "float" else L.VCLASS_NATIVE
     audit = None if vc == L.VCLASS_FLOAT else load_worker(audit_worker,
                                                           vclass=vclass)
@@ -205,8 +229,14 @@ def buy(job, host=None, port=None, peers=None, chunks=1, k=3, vclass="native",
         timeout = MODEL_BUY_TIMEOUT if vc == L.VCLASS_FLOAT else NATIVE_BUY_TIMEOUT
     client = D.Daemon(identity_from_seed(seed), timeout=timeout)
     job_bytes = job if isinstance(job, (bytes, bytearray)) else str(job).encode()
+    cap = "compute:float" if vc == L.VCLASS_FLOAT else "compute:native"
+    if via_relay:            # reach a provider parked at a relay (through NAT)
+        rh, rp = split_addr(via_relay)
+        preamble = W.relay_buy_frame(cap, relay_secret)
+        res = client.request_job(rh, rp, job_bytes, n_chunks=chunks, k=k,
+                                 vclass=vc, audit=audit, preamble=preamble)
+        return client, (rh, rp), res
     if peers:
-        cap = "compute:float" if vc == L.VCLASS_FLOAT else "compute:native"
         addr, res = client.buy_from_mesh(cap, job_bytes, chunks, k, vc,
                                          audit=audit, candidates=peers)
         return client, addr, res

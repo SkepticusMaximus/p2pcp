@@ -31,20 +31,31 @@ def _serve(args):
     wk = node.load_worker(args.worker, vclass="float" if args.float_ else "native")
     node.serve(wk, host=args.host, port=args.port, seed=args.seed,
                keyfile=args.keyfile, peers=node.parse_peers(args.peers),
-               label=args.worker or "demo")
+               label=args.worker or "demo",
+               relay=args.relay, relay_secret=args.relay_secret,
+               relay_pool=args.relay_pool)
+
+
+def _relay(args):
+    from . import relay as R
+    argv = ["--host", args.host, "--port", str(args.port)]
+    if args.relay_secret:
+        argv += ["--secret", args.relay_secret]
+    R.main(argv)
 
 
 def _buy(args):
-    if not args.peers and args.port is None:
-        print("[buy] give --port (a node) or --peers (discover one)",
-              file=sys.stderr)
+    if not args.peers and args.port is None and not args.relay:
+        print("[buy] give --port (a node), --peers (discover one), or --relay "
+              "(reach one parked at a relay)", file=sys.stderr)
         raise SystemExit(1)
     client, addr, res = node.buy(
         args.job, host=args.host, port=args.port,
         peers=node.parse_peers(args.peers) if args.peers else None,
         chunks=args.chunks, k=args.k,
         vclass="float" if args.float_ else "native",
-        audit_worker=args.worker, seed=args.seed, timeout=args.timeout)
+        audit_worker=args.worker, seed=args.seed, timeout=args.timeout,
+        via_relay=args.relay, relay_secret=args.relay_secret)
     try:
         if res is None or res.get("settled_chunks", 0) < 1:
             print("[buy] nothing settled (node offline, refused, or audit failed).",
@@ -108,7 +119,21 @@ def build_parser():
     ps.add_argument("--seed", default="node")
     ps.add_argument("--keyfile", help="persist identity + earnings + peer book")
     ps.add_argument("--peers", help="bootstrap peers, host:port,host:port")
+    ps.add_argument("--relay", help="host:port of a p2pcp relay — be sellable from "
+                    "behind NAT by parking connections there")
+    ps.add_argument("--relay-secret", dest="relay_secret",
+                    help="shared key the relay requires (allow-list)")
+    ps.add_argument("--relay-pool", dest="relay_pool", type=int, default=4,
+                    help="how many connections to keep parked at the relay")
     ps.set_defaults(fn=_serve)
+
+    pr = sub.add_parser("relay",
+                        help="run a keyless reverse-dial rendezvous for NAT'd nodes")
+    pr.add_argument("--host", default="0.0.0.0")
+    pr.add_argument("--port", type=int, default=8700)
+    pr.add_argument("--relay-secret", dest="relay_secret",
+                    help="shared allow-list key registrants/callers must present")
+    pr.set_defaults(fn=_relay)
 
     pb = sub.add_parser("buy", help="buy compute (replay-audited)")
     pb.add_argument("job", help="the job payload (text)")
@@ -124,6 +149,10 @@ def build_parser():
     pb.add_argument("--seed", default="buyer")
     pb.add_argument("--timeout", type=float,
                     help="wire-recv timeout in seconds (default: 240 float, 15 native)")
+    pb.add_argument("--relay", help="reach a provider parked at this relay "
+                    "host:port (through NAT)")
+    pb.add_argument("--relay-secret", dest="relay_secret",
+                    help="shared key the relay requires (allow-list)")
     pb.set_defaults(fn=_buy)
 
     pw = sub.add_parser("wallet", help="show account + CompuCoin + voting weight")

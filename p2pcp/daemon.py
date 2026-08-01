@@ -325,6 +325,63 @@ class Daemon:
         finally:
             peer.close()
 
+    # ── reverse-dial: sell from behind NAT (break-out) ───────────────────────
+    # A NAT'd node can't be dialed, so it DIALS OUT to a relay and PARKS a
+    # connection; when the relay splices a buyer in, this serves ONE job over that
+    # outbound socket — the SERVER role on a connection we opened. The seller side
+    # is byte-identical to an accepted peer (same HELLO, same wire contract); only
+    # the socket's provenance differs. See p2pcp.relay.
+
+    def _reverse_cap(self):
+        """The compute class to advertise when parking at a relay — the class this
+        node's worker actually serves, so a buyer matched to us gets what it asked
+        for. Falls back to native if no compute worker is installed."""
+        for c in self.caps:
+            if c.startswith("compute:"):
+                return c
+        return "compute:native"
+
+    def _serve_reverse(self, peer):
+        """Serve ONE job over a relay-parked outbound connection. The buyer's HELLO
+        arrives only when the relay splices a buyer in, which may be a long wait —
+        so the FIRST recv blocks with no timeout (a parked worker). Once the
+        exchange is live, `_serve_peer` applies the normal per-frame timeouts."""
+        account = self._verify_hello(peer.recv(timeout=None))   # block until spliced
+        peer.send(self._hello_frame())
+        self._record(account, peer)
+        self._serve_peer(peer, account)
+
+    def serve_reverse(self, relay_host, relay_port, cap=None, secret=None, pool=4,
+                      backoff=1.0):
+        """Break out of NAT: keep `pool` connections PARKED at a relay, each ready
+        to serve one inbound job, refilling as they're consumed. The node keeps its
+        normal listener too — this just adds an outbound-reachable path. Returns a
+        `stop()` callable that ends the pool (its daemon threads exit on the next
+        cycle). Idempotent under a dead/blipping relay: a failed dial just backs
+        off and retries, never killing the pool."""
+        cap = cap or self._reverse_cap()
+        stop = threading.Event()
+        preamble = W.relay_sell_frame(cap, secret)
+
+        def worker():
+            while not stop.is_set():
+                peer = None
+                try:
+                    peer = self.organ.connect(relay_host, int(relay_port),
+                                               timeout=self.timeout)
+                    peer.send(preamble)
+                    self._serve_reverse(peer)      # parked; serves one job, returns
+                except Exception:                  # noqa: BLE001 — a blip must not
+                    stop.wait(backoff)             # kill the pool; back off + retry
+                finally:
+                    if peer is not None:
+                        peer.close()
+
+        for _ in range(max(1, int(pool))):
+            threading.Thread(target=worker, name="p2pcp-reverse",
+                             daemon=True).start()
+        return stop.set
+
     # ── the wire contract (§4 L2 / §14 step 5) ───────────────────────────────
     # The PAID job. A requester streams a JOB; the worker runs it through its
     # adapter and streams RESULT chunks; each chunk is SETTLED before the next
@@ -491,18 +548,29 @@ class Daemon:
                                        r.signing_bytes())
 
     # -- requester role -------------------------------------------------------
-    def _dial(self, host, port, retries=2, backoff=0.03):
+    def _dial(self, host, port, retries=2, backoff=0.03, preamble=None):
         """Connect + HELLO, with a bounded retry for a TRANSIENT dial failure — a
         peer that just started listening, or a brief blip. The retry covers only
         connect+handshake, never a mid-job step, so it can never double-deliver or
         double-pay: no JOB has been sent yet. Raises the last error if all attempts
-        fail (the caller's contract is unchanged from a single connect)."""
+        fail (the caller's contract is unchanged from a single connect).
+
+        `preamble` (bytes), if given, is sent as the FIRST framed message after
+        connect and before HELLO — the transport-routing hook: a relay's RLY_BUY
+        control frame, which the relay reads to splice us to a parked seller. It is
+        never seen by the seller; the HELLO that follows is the real handshake."""
         last = None
         for attempt in range(retries + 1):
             peer = None
             try:
                 peer = self.organ.connect(host, port, timeout=self.timeout)
+                if preamble is not None:
+                    peer.send(preamble)
                 return peer, self._handshake_outbound(peer)
+            except HandshakeError:
+                if peer is not None:
+                    peer.close()       # match connect(): don't leak the socket, and
+                raise                  # a bad/absent HELLO won't fix on retry
             except (SOCK.OrganError, ValueError) as e:
                 last = e
                 if peer is not None:
@@ -512,14 +580,19 @@ class Daemon:
         raise last
 
     def request_job(self, host, port, job: bytes, n_chunks: int, k: int,
-                    vclass=L.VCLASS_NATIVE, audit=None):
+                    vclass=L.VCLASS_NATIVE, audit=None, preamble=None):
         """Dial a worker, stream a JOB, and pay per delivered+verified chunk.
         Returns a summary dict. If ``audit`` (a deterministic worker adapter of
         the same class) is supplied, each chunk is REPLAYED and compared before
         paying — the determinism moat as a pre-payment check (§3/§10); a forged
-        output is never paid for. Exposure is bounded to one chunk of k (§11)."""
+        output is never paid for. Exposure is bounded to one chunk of k (§11).
+
+        ``preamble`` (bytes) reaches the seller through a relay: it is sent to
+        ``host:port`` (the relay) before HELLO, which splices us to a parked
+        provider. The paid exchange below is byte-identical whether the seller was
+        dialed directly or reached through the relay — trust is the signatures."""
         self._ensure_open()
-        peer, worker_id = self._dial(host, port)
+        peer, worker_id = self._dial(host, port, preamble=preamble)
         settled = 0
         receipts = []
         outputs = []

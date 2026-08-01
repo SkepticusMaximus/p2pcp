@@ -82,6 +82,26 @@ docker build -t p2pcp .
 docker run --rm -p 9000:9000 p2pcp serve --host 0.0.0.0 --port 9000
 ```
 
+## Break out of NAT — the reverse-dial relay
+
+A node behind a home router can't accept inbound connections, so it can't be
+reached to sell — otherwise the mesh is LAN / public-IP only. A **relay** fixes
+that: the seller dials OUT to it and PARKS a connection, and buyers reach the
+seller THROUGH the relay. Like the gateway it's a dumb, keyless pipe — it splices
+opaque frames and holds no key, so trust stays end-to-end (the buyer still
+replay-audits native work or rides quorum for float; the relay can forge nothing).
+
+```
+p2pcp relay --port 8700 [--secret SHARED]                       # a public rendezvous
+p2pcp serve --relay <relay-host>:8700 [--relay-secret SHARED]   # sell from behind NAT
+p2pcp buy "job" --relay <relay-host>:8700 [--relay-secret SHARED]
+```
+
+`--secret` is a shared allow-list key: the mesh across the internet, but only for
+parties who hold it — the closed-mesh setting until open admission (Sybil-cheap
+fresh keys) is priced. The relay speaks through the one organ, so it adds no second
+network surface.
+
 ## How the trust works
 
 One paid job, chunk by chunk:

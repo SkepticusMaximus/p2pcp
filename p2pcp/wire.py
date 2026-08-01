@@ -37,6 +37,16 @@ RECORD = "RECORD"              # a gossiped ledger record (v0.2 — witness a br
 STATUS_REQ = "STATUS_REQ"      # ask a node for its public status (observability)
 STATUS = "STATUS"              # response: {account, caps, peers, jobs_served, ...}
 
+# Relay rendezvous control (v0.3 — the reverse-dial break-out). A node behind NAT
+# cannot accept inbound, so it DIALS OUT to a public relay and PARKS the connection;
+# a buyer reaches it THROUGH the relay. These three are the relay's control
+# preamble — read ONCE by the relay to route, after which it splices opaque frames
+# blind. They never cross to the counterparty, and the relay interprets nothing
+# else: trust stays end-to-end (ed25519), never in the relay.
+RLY_SELL = "RLY_SELL"          # seller→relay: park me as a provider of `cap`
+RLY_BUY = "RLY_BUY"            # buyer→relay: splice me to a provider of `cap`
+RLY_NONE = "RLY_NONE"          # relay→buyer: no provider parked for that class
+
 
 def encode(frame: dict) -> bytes:
     """Canonical bytes for a frame (sorted keys, tight separators, UTF-8)."""
@@ -52,6 +62,23 @@ def decode(payload: bytes) -> dict:
     if not isinstance(frame, dict):
         raise ValueError("frame must be a JSON object")
     return frame
+
+
+def relay_sell_frame(cap: str, secret=None) -> bytes:
+    """A seller's control preamble: 'park me as a provider of `cap`'. `secret`, if
+    set, is the shared allow-list key the relay checks before parking."""
+    f = {"t": RLY_SELL, "cap": cap}
+    if secret:
+        f["secret"] = secret
+    return encode(f)
+
+
+def relay_buy_frame(cap: str, secret=None) -> bytes:
+    """A buyer's control preamble: 'splice me to a provider of `cap`'."""
+    f = {"t": RLY_BUY, "cap": cap}
+    if secret:
+        f["secret"] = secret
+    return encode(f)
 
 
 def receipt_to_dict(r) -> dict:
