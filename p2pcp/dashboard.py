@@ -198,7 +198,13 @@ def main(argv=None):
     # ── buy inference from the selected node (answer lands below) ───────────
     trade = tk.Frame(root, bg=BG)
     trade.pack(fill="x", padx=12, pady=(0, 4))
-    tk.Label(trade, text="Ask it:", bg=BG, fg=DIM, font=mono).pack(side="left")
+    tk.Label(trade, text="Ask", bg=BG, fg=DIM, font=mono).pack(side="left")
+    ask_sel = tk.StringVar(value=addrs[-1])     # its OWN target, not the load one
+    ask_touched = [False]
+    ask_om = tk.OptionMenu(trade, ask_sel, *addrs,
+                           command=lambda *_: ask_touched.__setitem__(0, True))
+    ask_om.config(bg=PANEL, fg=FG, font=mono, relief="flat", highlightthickness=0)
+    ask_om.pack(side="left", padx=4)
     prompt = tk.Entry(trade, bg=PANEL, fg=FG, insertbackground=FG,
                       relief="flat", font=mono)
     prompt.insert(0, "what is balanced ternary?")
@@ -220,7 +226,7 @@ def main(argv=None):
         ans.config(state="disabled", fg=color)
 
     def do_buy():
-        addr = sel.get()
+        addr = ask_sel.get()
         st = next((s for s in states if s.addr == addr), None)
         q = prompt.get().strip()
         if not q:
@@ -255,8 +261,10 @@ def main(argv=None):
             bal.config(text=f"{st.balance} CompuCoin{flow}",
                        fg=(GRN if st.coin_delta > 0
                            else (RED if st.coin_delta < 0 else FG)))
-            sub.config(text=f"jobs {st.jobs}    chunks {st.chunks}    "
-                            f"({st.balance} burnable → votes)")
+            kind = ("a model · float" if "compute:float" in st.caps
+                    else ("raw compute · native" if "compute:native" in st.caps
+                          else "buy-only (no worker)"))
+            sub.config(text=f"jobs {st.jobs}    chunks {st.chunks}    · sells {kind}")
             cps = st.chunks_per_sec()
             cv.delete("all")
             w = cv.winfo_width() or 320
@@ -264,6 +272,11 @@ def main(argv=None):
             if fill > 0:
                 cv.create_rectangle(0, 0, int(w * fill), 14, fill=GRN, outline="")
             rate.config(text=f"{cps:.1f} ch/s")
+        if not ask_touched[0]:                 # point "Ask" at a real model, once known
+            for s in states:
+                if "compute:float" in s.caps:
+                    ask_sel.set(s.addr)
+                    break
         if load.running():
             stat.config(text=f"drawing load — {load.buys} buys, coins flowing",
                         fg=GRN)
