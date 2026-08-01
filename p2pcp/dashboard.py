@@ -36,6 +36,7 @@ class NodeState:
         self.jobs = 0
         self.chunks = 0
         self.coin_delta = 0
+        self.caps = []
         self._hist = []       # [(monotonic_t, chunks), ...] for the rate
 
     def poll(self):
@@ -47,6 +48,7 @@ class NodeState:
             self.online = False
             return
         self.online = True
+        self.caps = list(s.get("caps") or [])
         prev = self.balance
         self.balance = int(s.get("balance", 0))
         self.coin_delta = self.balance - prev
@@ -63,6 +65,30 @@ class NodeState:
         (t0, c0), (t1, c1) = self._hist[0], self._hist[-1]
         dt = t1 - t0
         return (c1 - c0) / dt if dt > 0 else 0.0
+
+
+def buy_once(addr, prompt, caps, k=3):
+    """One GUI-driven purchase from `addr`. Picks the trade class from the node's
+    advertised caps: a float seller (a model) is bought float-class on trust; a
+    native seller is bought replay-audited against the demo worker. Returns
+    (ok, text) — the model's answer, or why not."""
+    host, _, port = addr.rpartition(":")
+    try:
+        if "compute:float" in caps:
+            _, _, res = N.buy(prompt, host=host or "127.0.0.1", port=int(port),
+                              chunks=1, k=k, vclass="float")
+        else:
+            _, _, res = N.buy(prompt, host=host or "127.0.0.1", port=int(port),
+                              chunks=1, k=k)
+        if res.get("settled_chunks", 0) < 1:
+            return False, "(no result — node declined, offline, or audit failed)"
+        out = res["outputs"][0]
+        try:
+            return True, out.decode("utf-8")
+        except UnicodeDecodeError:
+            return True, f"(binary result, {len(out)} bytes — demo worker)"
+    except Exception as e:
+        return False, f"(buy failed: {type(e).__name__}: {e})"
 
 
 class LoadGen:
@@ -168,6 +194,54 @@ def main(argv=None):
     btn = tk.Button(ctl, text="▶ Draw load", command=toggle, bg=ACC, fg="#fff",
                     font=mono, relief="flat", activebackground=GRN)
     btn.pack(side="left", padx=12)
+
+    # ── buy inference from the selected node (answer lands below) ───────────
+    trade = tk.Frame(root, bg=BG)
+    trade.pack(fill="x", padx=12, pady=(0, 4))
+    tk.Label(trade, text="Ask it:", bg=BG, fg=DIM, font=mono).pack(side="left")
+    prompt = tk.Entry(trade, bg=PANEL, fg=FG, insertbackground=FG,
+                      relief="flat", font=mono)
+    prompt.insert(0, "what is balanced ternary?")
+    prompt.pack(side="left", fill="x", expand=True, padx=6)
+
+    ans_frame = tk.Frame(root, bg=BG)
+    ans_frame.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+    ans = tk.Text(ans_frame, height=6, bg="#0c0e14", fg=FG, font=mono,
+                  wrap="word", state="disabled")
+    sb = tk.Scrollbar(ans_frame, orient="vertical", command=ans.yview)
+    ans.configure(yscrollcommand=sb.set)
+    sb.pack(side="right", fill="y")
+    ans.pack(side="left", fill="both", expand=True)
+
+    def show_answer(text, color=FG):
+        ans.config(state="normal")
+        ans.insert("end", text + "\n")
+        ans.see("end")
+        ans.config(state="disabled", fg=color)
+
+    def do_buy():
+        addr = sel.get()
+        st = next((s for s in states if s.addr == addr), None)
+        q = prompt.get().strip()
+        if not q:
+            return
+        buybtn.config(state="disabled", text="buying…")
+        show_answer(f"→ {addr}  ¦  {q}", DIM)
+
+        def work():
+            ok, text = buy_once(addr, q, st.caps if st else [])
+            def done():
+                show_answer(("  " + text) if ok else ("  " + text),
+                            GRN if ok else RED)
+                buybtn.config(state="normal", text="Buy inference 🪙")
+            root.after(0, done)
+        threading.Thread(target=work, daemon=True).start()
+
+    buybtn = tk.Button(trade, text="Buy inference 🪙", command=do_buy, bg=ACC,
+                       fg="#fff", font=mono, relief="flat",
+                       activebackground=GRN)
+    buybtn.pack(side="left")
+    prompt.bind("<Return>", lambda e: do_buy())
 
     def tick():
         for st in states:
