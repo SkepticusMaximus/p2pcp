@@ -148,6 +148,24 @@ class Daemon:
             _c = _cap_of.get(_vc)
             if _c and _c not in self.caps:
                 self.caps = self.caps + (_c,)
+        # §15 honesty: advertise the REAL model behind an OpenAI-family backend.
+        # Env names lie (OPENAI_MODEL is whatever the operator typed into the
+        # unit file); the backend itself knows what it loaded — llama.cpp & kin
+        # report the loaded file on /v1/models. Probed once at start; if the
+        # backend is down/odd we simply advertise no model cap (old behaviour).
+        _base = os.environ.get("OPENAI_BASE")
+        if _base and any(c.startswith("compute:") for c in self.caps):
+            try:
+                import urllib.request as _rq
+                with _rq.urlopen(_base.rstrip("/") + "/v1/models", timeout=2) as _r:
+                    _name = json.load(_r)["data"][0]["id"].rsplit("/", 1)[-1]
+                if _name.endswith(".gguf"):
+                    _name = _name[:-5]
+                _mc = "model:" + _name[:48]
+                if _mc not in self.caps:
+                    self.caps = self.caps + (_mc,)
+            except Exception:
+                pass
         self.max_peers = MAX_PEERS                        # eclipse resistance (§9.3)
         self.max_learn_per_fetch = MAX_LEARN_PER_FETCH
         self._anchors = set()                             # never-evicted peers
