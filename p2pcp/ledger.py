@@ -212,6 +212,12 @@ def get_alg(alg: int):
 VCLASS_TCM: int = 0         # ledger validation — replay, exact
 VCLASS_NATIVE: int = 1      # native integer model — replay, exact (the flagship)
 VCLASS_FLOAT: int = -1      # float-accumulating worker — quorum only, never replay
+VCLASS_TRAINING: int = 2    # integer-deterministic TRAINING — replay, exact,
+                            # but R1-FLAGGED: earns spendable credit, NEVER
+                            # burnable weight, until the weight-pricing
+                            # economics item closes deliberately (standing
+                            # rule R1 of 03-08; captain's ruling 20-09-2026:
+                            # "flag it" — CF5's recommendation stands)
 
 
 def is_replay_class(vclass: int) -> bool:
@@ -222,8 +228,12 @@ def is_replay_class(vclass: int) -> bool:
 
 def is_weight_bearing(vclass: int) -> bool:
     """Only replay-class compute mints weight-bearing credit (§10). Float work
-    earns spendable credit but NEVER a vote."""
-    return is_replay_class(vclass)
+    earns spendable credit but NEVER a vote. TRAINING work is replay-class and
+    fully auditable, yet deliberately EXCLUDED here per R1 (03-08): nothing
+    couples training-mint to voting weight until the weight-pricing economics
+    item is closed. Enumerated allow-list, not a deny-list, so the next new
+    class also arrives non-burnable until someone decides otherwise."""
+    return vclass in (VCLASS_TCM, VCLASS_NATIVE)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

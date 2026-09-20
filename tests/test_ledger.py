@@ -535,5 +535,36 @@ class TestPersistence(unittest.TestCase):
         self.assertFalse(led.verify())                             # detected
 
 
+class TestTrainingClassR1Flag(unittest.TestCase):
+    """R1 (03-08, made binding by the chair; captain's ruling 20-09-2026
+    "flag it"): training-mint credit is replay-auditable and SPENDABLE but
+    NEVER burnable into governance weight until the weight-pricing economics
+    item closes deliberately. The allow-list form means any future class
+    also arrives non-burnable by default."""
+
+    def test_training_settles_spendable_but_never_burnable(self):
+        led = P.Ledger()
+        w, buyer = ident(b"r1-worker"), ident(b"r1-buyer")
+        led.open_account(w)
+        led.open_account(buyer)
+        led.settle_work(w, buyer, 4, vclass=P.VCLASS_TRAINING)
+        self.assertEqual(led.balance(w.account_id), 4)      # paid in full
+        self.assertEqual(led.burnable(w.account_id), 0)     # R1: no franchise
+
+    def test_training_burn_refused(self):
+        led = P.Ledger()
+        w, buyer = ident(b"r1-w2"), ident(b"r1-b2")
+        led.open_account(w)
+        led.open_account(buyer)
+        led.settle_work(w, buyer, 4, vclass=P.VCLASS_TRAINING)
+        with self.assertRaises(Exception):
+            led.burn(w, 1, timestamp=NOW, now=NOW)
+
+    def test_class_semantics(self):
+        self.assertTrue(P.is_replay_class(P.VCLASS_TRAINING))
+        self.assertFalse(P.is_weight_bearing(P.VCLASS_TRAINING))
+        self.assertTrue(P.is_weight_bearing(P.VCLASS_NATIVE))
+
+
 if __name__ == "__main__":
     unittest.main()

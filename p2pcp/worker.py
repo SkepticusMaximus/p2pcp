@@ -25,6 +25,7 @@ import hashlib
 # across module instances; the ledger owns the canon and these MUST match it.
 VCLASS_NATIVE = 1       # replay-class, weight-bearing (== L.VCLASS_NATIVE)
 VCLASS_FLOAT = -1       # quorum-class, rent not votes  (== L.VCLASS_FLOAT)
+VCLASS_TRAINING = 2     # replay-class training — R1-flagged: pays, never votes (== L.VCLASS_TRAINING)
 
 
 class WorkerAdapter:
